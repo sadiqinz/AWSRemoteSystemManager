@@ -1,0 +1,288 @@
+Description: Creates API Gateway as well as other required resources
+Parameters:
+  
+  CodeRepoBucket:
+    Type: String
+    Description: Code Repository S3 Bucket Name
+  LambdaFunctionFileName:
+    Type: String
+    Description: Name of Lambda Function Zip File
+  InstanceType:
+    Type: String
+    Default: t2.medium
+    Description: Windows Instance Size
+    AllowedValues:
+      - t2.micro
+      - t2.medium
+  LatestAMiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2016-English-Full-Base
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the web server
+    Type: String
+    MinLength: 1
+    MaxLength: 255
+    #AllowedPattern: '[\\x20-\\x7E]*'
+    #ConstraintDescription: 'Can contain only ASCII characters.'
+
+  # DevTopic:
+  #   Type: String  
+  #   Description: Dev SNS Topic
+
+
+Resources:
+  # Create Windows Instane that will be used for calling SSM Commands on
+  WindowsTestInstance:
+    Type: AWS::EC2::Instance
+    Properties: 
+      ImageId: !Ref LatestAMiId
+      KeyName: 
+        Ref: "KeyName"
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroups:
+        - !Ref Ec2SecurityGroup
+      UserData:
+        Fn::Base64:  !Sub | 
+            <powershell>
+            Set-ExecutionPolicy Unrestricted -Force
+            New-Item -ItemType directory -Path 'C:\temp'
+            # Install IIS and Web Management Tools.
+            Import-Module ServerManager
+            install-windowsfeature web-server, web-webserver -IncludeAllSubFeature
+            install-windowsfeature web-mgmt-tools
+            Start-Sleep -Second 30
+            # Create new directory and download PS script for updating webpage
+            New-Item C:\Scripts -ItemType directory
+            # Create powershell script file
+            Add-Content -Path 'C:\Scripts\updateWebPage.ps1' -Value "param ([string]`$DisplayText)
+            # Create Index.html file
+            `$file = 'C:\inetpub\wwwroot\index.html'
+            '<html>' > `$file
+            '<h1>' >> `$file
+            #Replace existing Heading with the text provided
+            `$DisplayText >> `$file
+            '</h1>' >> `$file
+            '</html>' >> `$file"
+            
+            C:\Scripts\updateWebPage.ps1 'Hello World, Whats up Yo!!!'
+            #Signal to CF to confirm we have updated the instance
+            cfn-signal --stack ${AWS::StackName} --resource WindowsTestInstance --region ${AWS::Region}
+            </powershell>      
+    CreationPolicy: 
+      ResourceSignal: 
+        Timeout : PT15M
+        
+      
+  # Create Instance Profile
+  EC2InstanceProfile:      
+    Type: AWS::IAM::InstanceProfile
+    Properties:     
+      Roles:
+        - !Ref EC2InstnaceRole
+      InstanceProfileName: 'DefaultEC2InstanceProfile'
+  # Security group for our instnace
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Default Group with no Access
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0       
+  
+  # Create Initial API Gateway, resource and deployment stage
+  APIGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-RestApi'
+      EndpointConfiguration: 
+          Types:
+            - REGIONAL
+
+  GatewayProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt APIGatewayRestApi.RootResourceId
+      RestApiId: !Ref APIGatewayRestApi
+      PathPart: 'UpdateServer'
+
+  ApiAnyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: "true"
+      RestApiId: !Ref APIGatewayRestApi
+      ResourceId: !Ref GatewayProxyResource
+      HttpMethod: POST
+      AuthorizationType: NONE      
+      # RequestParameters:
+      #   method.request.path.proxy: true
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels: { "application/json": "Empty" }
+      Integration:
+        Type: "AWS"
+        IntegrationHttpMethod: "POST"
+        PassthroughBehavior: "WHEN_NO_TEMPLATES"
+        Uri: 
+          Fn::Join: 
+            - ""
+            - 
+              - "arn:aws:apigateway:"
+              - !Ref AWS::Region
+              - ":lambda:path/2015-03-31/functions/"
+              - !GetAtt ServerUpdateLambdaFunction.Arn
+              - "/invocations"
+          
+        IntegrationResponses:
+          - StatusCode: 200
+        RequestTemplates: 
+          "application/json": "##  See http://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-mapping-template-reference.html\n##  This template will pass through all parameters including path, querystring, header, stage variables, and context through to the integration endpoint via the body/payload\n#set($allParams = $input.params())\n{\n\"body-json\" : $input.json('$'),\n\"params\" : {\n#foreach($type in $allParams.keySet())\n    #set($params = $allParams.get($type))\n\"$type\" : {\n    #foreach($paramName in $params.keySet())\n    \"$paramName\" : \"$util.escapeJavaScript($params.get($paramName))\"\n        #if($foreach.hasNext),#end\n    #end\n}\n    #if($foreach.hasNext),#end\n#end\n},\n\"stage-variables\" : {\n#foreach($key in $stageVariables.keySet())\n\"$key\" : \"$util.escapeJavaScript($stageVariables.get($key))\"\n    #if($foreach.hasNext),#end\n#end\n},\n\"context\" : {\n    \"account-id\" : \"$context.identity.accountId\",\n    \"api-id\" : \"$context.apiId\",\n    \"api-key\" : \"$context.identity.apiKey\",\n    \"authorizer-principal-id\" : \"$context.authorizer.principalId\",\n    \"caller\" : \"$context.identity.caller\",\n    \"cognito-authentication-provider\" : \"$context.identity.cognitoAuthenticationProvider\",\n    \"cognito-authentication-type\" : \"$context.identity.cognitoAuthenticationType\",\n    \"cognito-identity-id\" : \"$context.identity.cognitoIdentityId\",\n    \"cognito-identity-pool-id\" : \"$context.identity.cognitoIdentityPoolId\",\n    \"http-method\" : \"$context.httpMethod\",\n    \"stage\" : \"$context.stage\",\n    \"source-ip\" : \"$context.identity.sourceIp\",\n    \"user\" : \"$context.identity.user\",\n    \"user-agent\" : \"$context.identity.userAgent\",\n    \"user-arn\" : \"$context.identity.userArn\",\n    \"request-id\" : \"$context.requestId\",\n    \"resource-id\" : \"$context.resourceId\",\n    \"resource-path\" : \"$context.resourcePath\"\n    }\n}\n"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiAnyMethod
+    Properties:
+      RestApiId: !Ref APIGatewayRestApi
+
+  #Create API Key to secure our API Gateway Deployment
+  ApiStageKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: 
+      - ProdApiStage
+    Properties:
+      Name: "ProdStageKey"
+      Description: "Prod Stage API Key"
+      Enabled: "true"
+      StageKeys:
+        - RestApiId: !Ref APIGatewayRestApi
+          StageName: !Ref ProdApiStage
+
+  #Createa a API usage plan associate with API and the stage
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      ApiStages:
+      - ApiId: !Ref APIGatewayRestApi
+        Stage: !Ref ProdApiStage
+      Description: Usage Plan for our API
+      Quota:
+        Limit: 5000
+        Period: MONTH
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+      UsagePlanName: Plan_API
+
+  #Create a usage plan api key
+  ApiusagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties : 
+      KeyId: !Ref ApiStageKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan  
+
+
+  ProdApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:      
+      RestApiId: !Ref APIGatewayRestApi
+      StageName: prod
+      DeploymentId: !Ref ApiDeployment
+      # Variables:
+      #   promptALB: '{{resolve:ssm:PROMPT_ALB_DNS:1}}'
+#Outputs for the script
+  ServerUpdateLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: 
+        S3Bucket: !Ref CodeRepoBucket
+        S3Key: !Ref LambdaFunctionFileName
+      Handler: "index.handler"
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Runtime: nodejs8.10
+      Timeout: 25
+      Environment:
+        Variables:
+          ENV1: !Sub '{"instanceid": "${WindowsTestInstance}", "scriptlocation": "C:\\scripts\\updateWebPage.ps1"}'
+      # TracingConfig:
+      #   Mode: Active 
+
+  # Create Lambda Function Role to be Assumed by our Lambda     
+  LambdaFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ssmacces-for-lambda
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - 'ssm:sendCommand'
+                - 'ssm:Get*'
+                - 'ssm:List*'
+              Resource:
+                - !Sub 'arn:aws:ec2:*:*:instance/${WindowsTestInstance}'
+                - 'arn:aws:ssm:*:*:document/*'            
+
+  # Create EC2 Instnace role so that it can update SSM
+  EC2InstnaceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      Policies:
+        - PolicyName: access-s3-code-repo
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:ListBucket'
+              Resource:
+                - !Sub 'arn:aws:s3:::${CodeRepoBucket}'
+                - !Sub 'arn:aws:s3:::${CodeRepoBucket}/*'   
+                
+  # Create Lambda Invoke Permission for our API Gateway
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt ServerUpdateLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGatewayRestApi}/*/POST/UpdateServer'
+      # 'arn:aws:apigateway:${AWS::Region}:${AWS::AccountId}:/restapis/${APIGatewayRestApi}/stages/${ProdApiStage}'
+        
+
+Outputs:        
+  APIGatewayURL:  
+    Description: Returns API Gateway URL
+    Value: !Sub 'https://${APIGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/UpdateServer'
+  EC2InstanceIP:  
+    Description: Returns Public IP Address of the instance
+    Value: !GetAtt WindowsTestInstance.PublicIp

@@ -1,0 +1,19 @@
+[
+    {
+        "ParameterKey": "CodeRepoBucket",
+        "ParameterValue": "tmp-code-bucket-2019"        
+    },
+    {
+        "ParameterKey": "LambdaFunctionFileName",
+        "ParameterValue": "ssmLambdaFunction.zip"        
+    },
+    {
+        "ParameterKey": "InstanceType",
+        "ParameterValue": "t2.medium"        
+    },
+    {
+        "ParameterKey": "KeyName",
+        "ParameterValue": "tempkey2019        
+    }
+
+]
